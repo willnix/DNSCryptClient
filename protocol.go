@@ -15,7 +15,9 @@ import (
 )
 
 var (
-	resolverMagic = [8]byte{0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38}
+	certificateMagic = "DNSC"
+	resolverMagic    = [8]byte{0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38}
+	dnsMaxSizeUDP    = 65536 - 20 - 8
 )
 
 // GetValidCert retrieves th DNSC certificate for a server
@@ -31,11 +33,16 @@ func GetValidCert(serverAddress string, providerName string, providerKey []byte)
 	}
 
 	if len(in.Answer) == 0 {
-		return SignedBincertFields{}, errors.New("No answer to pubkey DNS request!")
+		return SignedBincertFields{}, errors.New("No answer to pubkey DNS request")
 	}
 	t, ok := in.Answer[0].(*dns.TXT)
 	if !ok {
-		return SignedBincertFields{}, errors.New("First answer not a TXT record!")
+		return SignedBincertFields{}, errors.New("First answer not a TXT record")
+	}
+
+	// check for magic Bytes
+	if t.Txt[0][0:5] == certificateMagic {
+		return SignedBincertFields{}, errors.New("TXT record is not a DNSC certificate")
 	}
 
 	// decode weird TXT record representation
@@ -52,13 +59,17 @@ func GetValidCert(serverAddress string, providerName string, providerKey []byte)
 		return SignedBincertFields{}, err
 	}
 
-	// TODO: Check TXT magic bytes
-	// TODO: Check version fields for XSalsa or ChaCha
+	// Version indicates which crypto construction to use
+	// For X25519-XSalsa20Poly1305, <es-version> must be 0x00 0x01.
+	// For X25519-XChacha20Poly1305, <es-version> must be 0x00 0x02.
+	if bincert.VersionMinor != 0x01 {
+		return SignedBincertFields{}, errors.New("Only X25519-XSalsa20Poly13055 is supported")
+	}
 
 	// check signature
 	valid := ed25519.Verify(providerKey, bincert.SignedData[:], bincert.Signature[:])
 	if !valid {
-		return SignedBincertFields{}, errors.New("Invalid certificate Signature!")
+		return SignedBincertFields{}, errors.New("Invalid certificate Signature")
 	}
 
 	// parse inner structure to get pubkey, validity dates, etc.
@@ -80,17 +91,17 @@ func GetValidCert(serverAddress string, providerName string, providerKey []byte)
 	// compare with timestamps in cert
 	// uint32 -> uint64 should be safe
 	if now < uint64(bincertFields.TSBegin) {
-		return SignedBincertFields{}, errors.New("Certificate is not yet valid!")
+		return SignedBincertFields{}, errors.New("Certificate is not yet valid")
 	} else if now > uint64(bincertFields.TSEnd) {
-		return SignedBincertFields{}, errors.New("Certificate is no longer valid!")
+		return SignedBincertFields{}, errors.New("Certificate is no longer valid")
 	}
 
 	return bincertFields, nil
 }
 
-// ExchangeEncryptedAQuery resolves a domain with a simple encrypted dns A query.
+// ExchangeEncrypted exchanges encrypted dns query and returns the response message.
 // It needs the specifics of a DNSC server as obtained by calling GetValidCert()
-func ExchangeEncryptedAQuery(domain string, bincertFields SignedBincertFields) (string, error) {
+func ExchangeEncrypted(msg dns.Msg, bincertFields SignedBincertFields) (dns.Msg, error) {
 	// TODO: the following will be wrapped in a lookUP() function
 	queryHeader := DNSCryptQueryHeader{
 		ClientMagic: bincertFields.MagicQuery,
@@ -98,27 +109,24 @@ func ExchangeEncryptedAQuery(domain string, bincertFields SignedBincertFields) (
 	// Client Nonce
 	// The specification says half of the nonce should be zeros => ClientNonce[:12]
 	if _, err := rand.Read(queryHeader.ClientNonce[:12]); err != nil {
-		panic(err)
+		return dns.Msg{}, err
 	}
 	// KeyPair
 	clientPK, clientSK, err := box.GenerateKey(rand.Reader)
 	if err != nil {
-		panic(err)
+		return dns.Msg{}, err
 	}
 	queryHeader.ClientPublicKey = *clientPK
 
-	// build DNS query
-	m1 := new(dns.Msg)
-	m1.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	serializedDNSQuery, err := m1.PackBuffer(nil)
+	serializedDNSQuery, err := msg.PackBuffer(nil)
 	if err != nil {
-		panic(err)
+		return dns.Msg{}, err
 	}
 
 	// add padding
 	serializedDNSQuery, err = addPadding(serializedDNSQuery)
 	if err != nil {
-		panic(err)
+		return dns.Msg{}, err
 	}
 
 	// build nonce: <nonce> := <client_nonce><12 zeros>
@@ -134,22 +142,20 @@ func ExchangeEncryptedAQuery(domain string, bincertFields SignedBincertFields) (
 
 	conn, err := net.Dial("udp", serverAddress)
 	if err != nil {
-		return "", err
+		return dns.Msg{}, err
 	}
 	// send query
 	binary.Write(conn, binary.BigEndian, dnscryptQuery.Bytes())
 
 	///////////////////////////////////////////////////////////////////////////////////////
-	///////////////////////////////////////////////////////////////////////////////////////
 	// DONE SENDING
-	///////////////////////////////////////////////////////////////////////////////////////
 	///////////////////////////////////////////////////////////////////////////////////////
 
 	// receive
 	p := make([]byte, dnsMaxSizeUDP)
 	n, err := bufio.NewReader(conn).Read(p)
 	if err != nil {
-		return "", err
+		return dns.Msg{}, err
 	}
 
 	// parse response header
@@ -157,12 +163,12 @@ func ExchangeEncryptedAQuery(domain string, bincertFields SignedBincertFields) (
 	var responseHeader DNSCryptResponseHeader
 	err = binary.Read(responseHeaderBytes, binary.BigEndian, &responseHeader)
 	if err != nil {
-		return "", err
+		return dns.Msg{}, err
 	}
 
 	// check magic bytes
 	if responseHeader.ServerMagic != resolverMagic {
-		return "", errors.New("Magic bytes do not match!")
+		return dns.Msg{}, errors.New("Magic bytes do not match")
 	}
 
 	// encrypted reply
@@ -172,32 +178,21 @@ func ExchangeEncryptedAQuery(domain string, bincertFields SignedBincertFields) (
 	copy(nonce[:], append(responseHeader.ClientNonce[:], responseHeader.ServerNonce[:]...))
 	dnsResponse, ok := box.Open(nil, encryptedResponse, &nonce, &bincertFields.ServerPublicKey, clientSK)
 	if !ok {
-		return "", errors.New("Could not decrypt response!")
+		return dns.Msg{}, errors.New("Could not decrypt response")
 	}
 
 	// strip padding from the decrypted dns response
 	dnsResponse, err = removePadding(dnsResponse)
 	if err != nil {
-		return "", err
+		return dns.Msg{}, err
 	}
 
 	// parse dns response
-	m2 := new(dns.Msg)
-	err = m2.Unpack(dnsResponse)
+	responseMsg := new(dns.Msg)
+	err = responseMsg.Unpack(dnsResponse)
 	if err != nil {
-		return "", err
+		return dns.Msg{}, err
 	}
 
-	if len(m2.Answer) == 0 {
-		return "", errors.New("No answer section DNS in response!")
-	}
-
-	// Look for an A record. We ignore CNAMEs for now.
-	for _, answer := range m2.Answer {
-		if a, ok := answer.(*dns.A); ok {
-			return a.A.String(), nil
-		}
-	}
-
-	return "", errors.New("No A record in answer section!")
+	return *responseMsg, nil
 }
