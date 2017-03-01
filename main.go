@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/miekg/dns"
+	"github.com/willnix/dnscrypt"
 )
 import "os"
 
@@ -15,7 +16,7 @@ var (
 
 func main() {
 	// get the servers certificate
-	bincertFields, err := GetValidCert(serverAddress, providerName, providerKey)
+	bincertFields, err := dnscrypt.GetValidCert(serverAddress, providerName, providerKey)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -26,7 +27,7 @@ func main() {
 	msg.SetQuestion(dns.Fqdn(os.Args[1]), dns.TypeA)
 
 	// send the query
-	response, err := ExchangeEncrypted(msg, bincertFields)
+	response, err := dnscrypt.ExchangeEncrypted(serverAddress, msg, bincertFields)
 	if err != nil {
 		fmt.Println(err)
 		return
