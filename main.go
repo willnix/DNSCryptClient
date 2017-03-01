@@ -15,6 +15,11 @@ var (
 )
 
 func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Please specify domain to look up!")
+		return
+	}
+
 	// get the servers certificate
 	bincertFields, err := dnscrypt.GetValidCert(serverAddress, providerName, providerKey)
 	if err != nil {
